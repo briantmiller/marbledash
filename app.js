@@ -122,10 +122,11 @@
     const th = L.theme; scene.background = new T.Color(th.sky); scene.fog = new T.Fog(th.sky, 45, 130);
     document.body.style.background = '#' + new T.Color(th.sky).getHexString();
     const railCol = 0xffffff;
-    for (const p of L.pieces) {
+    for (const p of L.pieces.concat(L.sides)) {
       if (p.kind !== 'p') continue;
-      const grp = new T.Group(); grp.add(ribbon(p, -p.w / 2, p.w / 2, 0, 0.7, th.a, th.b, th.side));
-      if (p.rail) { grp.add(ribbon(p, -p.w / 2, -p.w / 2 + 0.22, 0.42, 0.42, railCol, 0xff7a7a, 0xd9dde8)); grp.add(ribbon(p, p.w / 2 - 0.22, p.w / 2, 0.42, 0.42, railCol, 0xff7a7a, 0xd9dde8)); }
+      const grp = new T.Group(), lift = p.par ? 0.02 : 0; grp.add(ribbon(p, -p.w / 2, p.w / 2, lift, 0.7, th.a, th.b, th.side));
+      if (p.railL) grp.add(ribbon(p, -p.w / 2, -p.w / 2 + 0.22, 0.42, 0.42, railCol, 0xff7a7a, 0xd9dde8));
+      if (p.railR) grp.add(ribbon(p, p.w / 2 - 0.22, p.w / 2, 0.42, 0.42, railCol, 0xff7a7a, 0xd9dde8));
       p.mesh = grp; world.add(grp);
     }
     // clouds / floating blobs for a sense of speed

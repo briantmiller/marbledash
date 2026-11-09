@@ -1,7 +1,7 @@
 /* Marble Dash core: level data + physics. No rendering here, so it can be tested headlessly. */
 (function (root) {
   'use strict';
-  const R = 0.5, G = 26, JUMP = 9.6, PADJUMP = 14.5;
+  const R = 0.5, G = 26, JUMP = 12.5, PADJUMP = 17;
   const DIFFS = [
     { name: 'Easy', speed: 7, gap: 0.7, width: 1.2, lat: 6, spd: 0.7 },
     { name: 'Medium', speed: 9, gap: 1, width: 1, lat: 7.5, spd: 1 },
@@ -10,9 +10,16 @@
   const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
   function moveOff(p, t) { return p.move ? p.move.amp * Math.sin(t * p.move.spd + p.move.ph) : 0; }
-  function cxBase(p, s) { const u = clamp((s - p.s0) / p.len, 0, 1); return p.cx0 + (p.cx1 - p.cx0) * u * u * (3 - 2 * u); }
+  function cxBase(p, s) {
+    const u = clamp((s - p.s0) / p.len, 0, 1), e = u * u * (3 - 2 * u);
+    return p.par ? cxBase(p.par, s) + p.off0 + (p.off1 - p.off0) * e : p.cx0 + (p.cx1 - p.cx0) * e;
+  }
+  function slopeOf(p) { return p.par ? slopeOf(p.par) + (p.yo1 - p.yo0) / p.len : (p.y1 - p.y0) / p.len; }
   function cxAt(p, s, t) { return cxBase(p, s) + moveOff(p, t); }
-  function yAt(p, s) { const u = clamp((s - p.s0) / p.len, 0, 1); return p.y0 + (p.y1 - p.y0) * u; }
+  function yAt(p, s) {
+    const u = clamp((s - p.s0) / p.len, 0, 1);
+    return p.par ? yAt(p.par, s) + p.yo0 + (p.yo1 - p.yo0) * u : p.y0 + (p.y1 - p.y0) * u;
+  }
   function pieceAt(L, s) {
     const a = L.pieces; let lo = 0, hi = a.length - 1;
     while (lo < hi) { const m = (lo + hi + 1) >> 1; if (a[m].s0 <= s) lo = m; else hi = m - 1; }
@@ -20,221 +27,154 @@
   }
   function obX(o, t) { return o.amp ? o.bx + o.amp * Math.sin(t * o.spd + o.ph) : o.x; }
 
-  /* ---------------- Levels ----------------
-     b.p(len,{dx,dy,w,rail,move})  track piece      b.g(len,{dy})  gap
-     b.c(n,x,t0,t1,x1,h)           coins            b.o(type,t,x,{d,...}) obstacle (d = min difficulty)
-     b.w(type,t,x)                 power-up         b.boost(t) b.jpad(t) b.ck() b.hint(txt,t) b.end()
-     x positions are lane fractions (-1 left edge .. 1 right edge), t is 0..1 along the piece. */
+  /* ---------------- Level building blocks ----------------
+     Builder: b.p(len,{dx,dy,w,rail,move}) main track piece, b.g(len,{dy}) gap, b.fork(len) empty stretch for branches,
+     b.br(side,{t0,t1,y0,y1}) branch inside a fork, b.lane(side,mode,{t0,t1}) side track beside the main track,
+     b.c() coins, b.o() obstacle ({d} = minimum difficulty), b.w() power-up, b.boost(t), b.jpad(t), b.hint(txt,t).
+     x positions are lane fractions (-1 .. 1), t is 0..1 along the current piece. */
+  const B = { // branch contents for forks: (b, side)
+    safe(b, sd) { b.br(sd).c(5, 0, .15, .85); },
+    coins(b, sd) { b.br(sd).c(11, 0, .08, .92); },
+    boost(b, sd) { b.br(sd).boost(.1).c(10, 0, .2, .95); },
+    blocks(b, sd) { b.br(sd).o('block', .3, -.5).o('block', .6, .5).o('block', .85, -.5, { d: 1 }).c(4, .5, .2, .4).c(4, -.5, .5, .7).w('magnet', .12, 0); },
+    spikes(b, sd) { b.br(sd).o('spikes', .3, -.5, { hw: .7 }).o('spikes', .6, .5, { hw: .7 }).o('spikes', .85, -.5, { hw: .7, d: 1 }).c(4, .5, .2, .4).c(4, -.5, .5, .7).w('shield', .1, 0); },
+    saws(b, sd) { b.br(sd).o('saw', .35, 0, { amp: .8 }).o('saw', .7, 0, { amp: .8, ph: 2 }).c(11, 0, .12, .95).w('shield', .06, 0); },
+    bumpers(b, sd) { b.br(sd).o('bumper', .3, -.4).o('bumper', .55, .4).o('bumper', .8, -.4).c(4, .5, .2, .45).c(4, -.5, .5, .7).c(3, .5, .75, .95); },
+    high(b, sd) {
+      b.br(sd, { t1: .25, y1: 3 }).c(3); b.br(sd, { t0: .25, t1: .7, y0: 3 }).c(7).w('magnet', .5, 0); b.br(sd, { t0: .7, y0: 3, y1: 0 }).c(4);
+    },
+    hops(b, sd) {
+      const g = (3.2 + 1.2 * b.d) / b.main.len;
+      b.br(sd, { t1: .26 }).c(4); b.br(sd, { t0: .26 + g, t1: .6 }).c(4).w('shield', .5, 0); b.br(sd, { t0: .6 + g }).c(5);
+    }
+  };
+  const S = { // sections: (b, ...args)
+    start(b) { b.p(16).c(5, 0, .4, .95); },
+    hint(b, txt) { b.p(9).hint(txt, 0).c(2); },
+    line(b, len) { len = len || 14; b.p(len).c(Math.round(len / 3)); },
+    curves(b, n, w) { for (let i = 0; i < (n || 3); i++) b.p(16, { dx: (i % 2 ? -1 : 1) * 4, w }).c(6); },
+    zig(b) { b.p(20).c(4, -.7, .1, .45, .7).c(4, .7, .55, .9, -.7); },
+    power(b, type) { b.p(10).w(type, .5, 0); },
+    slalom(b, type, n) {
+      n = n || 3; b.p(12 * n + 4); const moving = type === 'saw' || type === 'slider';
+      for (let i = 0; i < n; i++) {
+        const t = (i + .7) / (n + .4), x = i % 2 ? .55 : -.55;
+        if (moving) { b.o(type, t, 0, { amp: .8, ph: i * 2, d: i > 2 ? 1 : 0 }); b.c(3, 0, t + .08, t + .2); }
+        else { b.o(type, t, x, { d: i > 2 ? 1 : 0 }); b.c(3, -x, t - .08, t + .08); }
+      }
+    },
+    hops(b, n, len) { b.p(6); for (let i = 0; i < (n || 3); i++) { b.g(len || 3).c(3); b.p(12).c(3); } },
+    steps(b, n) { for (let i = 0; i < (n || 3); i++) { b.p(11, { dy: 1.5 }).c(3); b.g(2.5).c(3); } b.p(12).c(3); },
+    hill(b) { b.p(12, { dy: 2.5 }).c(4); b.p(12, { dy: -2.5 }).c(4); },
+    down(b) { b.p(18, { dy: -4 }).c(6); },
+    boostJump(b, gap, drop) {
+      b.p(14).boost(.3).c(5, 0, .4, 1); b.p(12, { dy: 3.2, rail: 2 });
+      b.g(gap || 6, { dy: -(drop || 2.5) }).c(5, 0, 0, 1, 0, 2.6); b.p(34).c(6, 0, .45, .9);
+    },
+    padJump(b, gap) { b.p(12).jpad(.8).c(3, 0, .1, .6); b.g(gap || 7).c(6, 0, 0, 1, 0, 4.8); b.p(18).c(4, 0, .45, .9); },
+    movers(b, n) { b.p(6); for (let i = 0; i < (n || 2); i++) { b.g(2.5); b.p(12, { move: [2.3, 1.2, i * 3.1], rail: 1 }); } b.g(2.5); b.p(12).c(4); },
+    narrow(b) { b.p(16, { dx: 4, w: 4.2 }).c(6); b.p(16, { dx: -4, w: 4.2 }).c(6); },
+    field(b, type) { b.p(26, { w: 7 }).o(type, .25, 0).o(type, .5, -.7).o(type, .5, .7).o(type, .78, 0, { d: 1 }).c(4, -.4, .3, .45, .4).c(4, .4, .58, .72, -.4); },
+    strips(b, n) { n = n || 2; b.p(11 * n + 6); for (let i = 0; i < n; i++) { const t = (i + .8) / (n + .6); b.o('spikes', t, 0, { hw: 5, hd: .5 }).c(3, 0, t - .09, t + .09, 0, 1.8); } },
+    spin(b, n) { n = n || 1; b.p(16 * n + 6, { w: 7 }); for (let i = 0; i < n; i++) { const t = (i + .8) / (n + .6); b.o('spinner', t, 0, { spd: i % 2 ? -1.7 : 1.6 }).c(3, 0, t - .09, t + .09, 0, 1.8); } },
+    smash(b) { b.p(28, { w: 7 }).w('giant', .08, 0).o('block', .32, -.75).o('block', .32, .75).o('bumper', .5, 0).o('block', .68, 0).o('block', .88, -.75).o('block', .88, .75).c(8, 0, .22, .95); },
+    fork(b, l, r, len) { b.p(10, { w: 11 }).c(3, -.55, .3, .9).c(3, .55, .3, .9); b.fork(len || 40); B[l](b, -1); B[r](b, 1); b.p(10, { w: 11 }).c(3); },
+    // a bonus track beside the main one: jump across to get in, it curves back by itself
+    sideLane(b, sd, type, pw) {
+      b.p(14).c(3); b.lane(sd, 'run', { t0: .3 }).c(4);
+      b.p(16).o(type, .3, -sd * .3).o(type, .78, sd * .2, { d: 1 }); b.lane(sd, 'run').c(6).w(pw || 'magnet', .5, 0);
+      b.p(14).c(3, -sd * .5); b.lane(sd, 'out').c(4, 0, .1, .6);
+    },
+    // a side road that peels off and skips the jumps
+    bypass(b, sd) {
+      b.p(14).c(3, -sd * .4); b.lane(sd, 'in');
+      for (let i = 0; i < 2; i++) { b.g(3).c(3); b.lane(sd, 'run'); b.p(12).c(4); b.lane(sd, 'run').c(2); }
+      b.g(3).c(3); b.lane(sd, 'run'); b.p(14).c(3, -sd * .4); b.lane(sd, 'out');
+    }
+  };
+  const TH = (sky, a, b, side) => ({ sky, a, b, side });
   const LEVELS = [
-    { name: 'First Roll', theme: { sky: 0x8fd3ff, a: 0x5ecb6b, b: 0x4fb85d, side: 0x2f7d3c }, make(b) {
-      b.p(16).hint('Slide your finger left and right to steer!', 0.1).c(5, 0, .45, .95);
-      b.p(16, { dx: 3 }).c(6);
-      b.p(16, { dx: -5 }).c(6);
-      b.p(14).c(5, -.6, .1, .9, .6);
-      b.p(12).ck().hint('Tap JUMP to hop over the gap!', 0.05).c(3, 0, .5, .9);
-      b.g(2.5).c(3);
-      b.p(14).c(5, .5);
-      b.g(2.5).c(3);
-      b.p(16, { dx: 3 }).w('magnet', .25, 0).c(4, -.7, .45, .95).c(4, .7, .45, .95);
-      b.p(16, { dx: -3 }).c(5, -.7).c(5, .7);
-      b.p(14).ck().boost(.3).c(6, 0, .4, 1);
-      b.p(10, { dy: 2 }).c(4);
-      b.p(12, { dy: -2 }).c(4);
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(6).c(5, 0, 0, 1, 0, 3.4);
-      b.end();
-    } },
-    { name: 'Hop Hop', theme: { sky: 0x7fe0e0, a: 0xffd166, b: 0xf4b942, side: 0xc98a2b }, make(b) {
-      b.p(14).c(4);
-      b.p(16, { dx: -3 }).o('block', .55, .5).c(5, -.5);
-      b.p(16, { dx: 3 }).o('block', .35, -.5).o('block', .8, .5).c(3, .5, .1, .5).c(3, -.5, .6, .95);
-      b.g(3).c(3);
-      b.p(10).c(3);
-      b.g(3).c(3);
-      b.p(10).c(3);
-      b.g(3.5).c(3);
-      b.p(18).ck().w('shield', .3, 0).o('block', .7, 0).c(3, -.7, .5, .9).c(3, .7, .5, .9);
-      b.p(12, { dy: 2.5 }).c(4);
-      b.g(3.5, { dy: -1 }).c(3);
-      b.p(16).o('block', .45, -.85, { d: 1 }).o('block', .45, .85, { d: 1 }).c(5);
-      b.p(14, { dx: 4, w: 4.5 }).c(6);
-      b.p(14, { dx: -4, w: 4.5 }).c(6);
-      b.p(14).ck().boost(.25).c(5, 0, .35, 1);
-      b.p(10, { dy: 3, rail: 2 });
-      b.g(5, { dy: -2 }).c(4, 0, 0, 1, 0, 2.2);
-      b.p(20).c(5, 0, .3, .9).o('block', .7, -.6, { d: 2 });
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(7).c(5, 0, 0, 1, 0, 3.4);
-      b.end();
-    } },
-    { name: 'Bumper Park', theme: { sky: 0xffc6e0, a: 0xff8fb8, b: 0xff7aa8, side: 0xc44f7d }, make(b) {
-      b.p(14).c(4);
-      b.p(18, { w: 7 }).o('bumper', .4, -.5).o('bumper', .75, .5).c(3, .5, .2, .5).c(3, -.5, .6, .9);
-      b.p(16, { dx: 4 }).c(6);
-      b.p(20, { w: 7 }).o('bumper', .25, 0).o('bumper', .55, -.7).o('bumper', .55, .7).o('bumper', .85, 0, { d: 1 }).c(4, -.4, .3, .5, .4).c(4, .4, .62, .82, -.4);
-      b.g(3).c(3);
-      b.p(14).ck().w('magnet', .4, 0).c(4, -.7).c(4, .7);
-      b.p(16, { dx: -4, w: 5 }).c(6);
-      b.p(12).boost(.3).c(5, 0, .4, 1);
-      b.p(12, { dy: 3, rail: 2 }).c(4);
-      b.g(5, { dy: -2 }).c(4, 0, 0, 1, 0, 2.2);
-      b.p(22).c(5, 0, .4, .9).o('block', .75, .6);
-      b.p(16, { dx: 3 }).ck().o('bumper', .4, .4).o('block', .8, -.5).c(4, -.5, .1, .6);
-      b.g(3.5).c(3);
-      b.p(10).c(3);
-      b.g(3.5).c(3);
-      b.p(18, { w: 7 }).o('bumper', .3, -.4).o('bumper', .3, .4, { d: 1 }).o('bumper', .7, 0).w('shield', .5, 0).c(3, -.8, .5, .9).c(3, .8, .5, .9);
-      b.p(12, { dy: -3 }).c(5);
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(7.5).c(5, 0, 0, 1, 0, 3.4);
-      b.end();
-    } },
-    { name: 'Spiky Path', theme: { sky: 0xffb37a, a: 0xb58cff, b: 0xa279f5, side: 0x6b4fb0 }, make(b) {
-      b.p(14).hint('Red spikes pop your marble. Steer around or jump!', 0.1).c(4);
-      b.p(16).o('spikes', .55, -.5).c(5, .5);
-      b.p(16, { dx: 3 }).o('spikes', .35, .5).o('spikes', .8, -.5).c(3, -.5, .1, .5).c(3, .5, .6, .95);
-      b.p(16).w('shield', .2, 0).o('spikes', .6, 0, { hw: 1.6 }).c(3, -.8, .4, .8).c(3, .8, .4, .8);
-      b.g(3).c(3);
-      b.p(16).ck().o('spikes', .5, 0, { hw: 3.6, hd: .5 }).c(3, 0, .32, .68, 0, 1.4).hint('Jump over the spike strip!', 0);
-      b.p(16, { dx: -4, w: 4.5 }).c(6);
-      b.p(16, { w: 4.5 }).o('spikes', .35, -.6, { hw: .7 }).o('spikes', .75, .6, { hw: .7 }).c(3, .5, .2, .5).c(3, -.5, .6, .9);
-      b.g(3.5).c(3);
-      b.p(14).ck().boost(.3).c(5, 0, .4, 1);
-      b.p(12, { dy: 3, rail: 2 });
-      b.g(5.5, { dy: -2.5 }).c(4, 0, 0, 1, 0, 2.2);
-      b.p(22).c(4, 0, .35, .7).o('spikes', .85, .5, { d: 1 });
-      b.p(18, { dx: 4 }).o('block', .3, .5).o('spikes', .6, -.5).o('spikes', .9, .3, { d: 1 }).w('magnet', .45, .5).c(4, .5, .55, .95);
-      b.p(16).ck().o('spikes', .35, 0, { hw: 3.6, hd: .5 }).o('spikes', .75, 0, { hw: 3.6, hd: .5 }).c(3, 0, .2, .5, 0, 1.4).c(3, 0, .6, .9, 0, 1.4);
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(8).c(5, 0, 0, 1, 0, 3.4);
-      b.end();
-    } },
-    { name: 'Sky Bridges', theme: { sky: 0xa9c9ff, a: 0xffffff, b: 0xe3ecfb, side: 0x9fb3d9 }, make(b) {
-      b.p(14).c(4);
-      b.p(16).o('slider', .6, 0, { amp: .7 }).c(5);
-      b.g(2.5).c(3);
-      b.p(10, { move: [2.2, 1.1], rail: 1 }).hint('This bridge slides. Ride it across!', 0);
-      b.g(2.5);
-      b.p(14).ck().w('magnet', .5, 0).c(4, -.6).c(4, .6);
-      b.p(16, { dx: 4, w: 4.5 }).c(6);
-      b.p(16).o('slider', .35, 0, { amp: .7 }).o('slider', .75, 0, { amp: .7, ph: 2 }).c(5);
-      b.g(3).c(3);
-      b.p(9, { move: [2.4, 1.2], rail: 1 });
-      b.g(2.5);
-      b.p(9, { move: [2.4, 1.2, 3.1], rail: 1 });
-      b.g(2.5);
-      b.p(14).ck().boost(.3).c(5, 0, .4, 1);
-      b.p(12, { dy: 3, rail: 2 });
-      b.g(6, { dy: -2.5 }).c(4, 0, 0, 1, 0, 2.2);
-      b.p(22).c(5, 0, .35, .85).o('block', .9, -.5, { d: 1 });
-      b.p(18, { dx: -4 }).o('slider', .4, 0, { amp: .75 }).o('spikes', .8, .5).w('shield', .6, -.5).c(4, -.5, .65, .95);
-      b.p(12, { dy: 2 }).ck().c(4);
-      b.g(3, { dy: -.5 }).c(3);
-      b.p(10, { move: [2.4, 1.3], rail: 1 });
-      b.g(3);
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(8).c(5, 0, 0, 1, 0, 3.4);
-      b.end();
-    } },
-    { name: 'Spinner City', theme: { sky: 0x2b2f6b, a: 0x4dd6d0, b: 0x3fc2bc, side: 0x1f7f7b }, make(b) {
-      b.p(14).c(4);
-      b.p(18, { w: 7 }).o('spinner', .6, 0).hint('Jump over the spinning bar!', 0).c(3, 0, .45, .75, 0, 1.4);
-      b.p(16, { dx: -3 }).c(6);
-      b.p(20, { w: 7 }).w('giant', .15, 0).o('block', .4, -.75).o('block', .4, .75).o('bumper', .6, 0).o('block', .8, 0).c(5, 0, .3, .9);
-      b.g(3).c(3);
-      b.p(18, { w: 7 }).ck().o('spinner', .5, 0, { spd: -1.8 }).c(3, -.8, .2, .8).c(3, .8, .2, .8);
-      b.p(16, { dx: 4, w: 4.5 }).c(6);
-      b.p(22, { w: 7 }).o('spinner', .3, 0).o('spinner', .75, 0, { spd: -1.6, d: 1 }).c(3, 0, .2, .4, 0, 1.4).c(4, 0, .5, .65);
-      b.g(3.5).c(3);
-      b.p(14).ck().boost(.3).c(5, 0, .4, 1);
-      b.p(12, { dy: 3.5, rail: 2 });
-      b.g(6, { dy: -3 }).c(4, 0, 0, 1, 0, 2.2);
-      b.p(24).c(5, 0, .35, .8).o('spikes', .92, -.5, { d: 1 });
-      b.p(16, { dx: -4 }).o('slider', .5, 0, { amp: .7 }).w('shield', .25, 0).c(4, 0, .6, .95);
-      b.p(20, { w: 7 }).ck().o('spinner', .4, 0, { spd: 2 }).o('spikes', .72, .85).o('spikes', .72, -.85, { d: 2 }).c(3, 0, .3, .6, 0, 1.4);
-      b.g(3).c(3);
-      b.p(10, { move: [2.2, 1.2], rail: 1 });
-      b.g(3);
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(8.5).c(5, 0, 0, 1, 0, 3.4);
-      b.end();
-    } },
-    { name: 'Saw Valley', theme: { sky: 0x47223a, a: 0xff9d4d, b: 0xf58a36, side: 0x9c4a12 }, make(b) {
-      b.p(14).hint('Watch out for the rolling saws!', 0.1).c(4);
-      b.p(18).o('saw', .6, 0, { amp: .8 }).c(5);
-      b.p(14, { dy: -3 }).c(5);
-      b.p(18, { dx: 3 }).o('saw', .4, 0, { amp: .8 }).o('saw', .8, 0, { amp: .8, ph: 2.5, d: 1 }).w('shield', .15, 0).c(5, 0, .5, .7);
-      b.g(3.5).c(3);
-      b.p(16).ck().o('spikes', .4, -.55).o('spikes', .4, .55).o('saw', .8, 0, { amp: .6 }).c(4, 0, .2, .6);
-      b.p(14, { dy: -3, w: 4.5 }).c(5);
-      b.p(12).boost(.2).c(4, 0, .4, 1);
-      b.p(12, { dy: 3.5, rail: 2 });
-      b.g(7, { dy: -3.5 }).c(5, 0, 0, 1, 0, 2.4);
-      b.p(24).c(5, 0, .4, .8);
-      b.p(18, { dx: -4 }).ck().w('giant', .15, 0).o('saw', .45, 0, { amp: .5 }).o('block', .7, -.85).o('block', .7, .85).o('saw', .9, 0, { amp: .5, ph: 1 }).c(5, 0, .3, .95);
-      b.g(3).c(3);
-      b.p(10, { move: [2.3, 1.3], rail: 1 });
-      b.g(3);
-      b.p(18).ck().o('spinner', .5, 0).o('saw', .88, 0, { amp: .8, d: 1 }).w('magnet', .2, 0).c(3, -.8, .3, .7).c(3, .8, .3, .7);
-      b.p(14, { dy: -3 }).c(5);
-      b.p(16, { w: 4.5 }).o('spikes', .4, -.6, { hw: .7 }).o('spikes', .75, .6, { hw: .7 }).c(3, .5, .25, .5).c(3, -.5, .6, .9);
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(8.5).c(5, 0, 0, 1, 0, 3.4);
-      b.end();
-    } },
-    { name: 'Grand Finale', theme: { sky: 0x14122e, a: 0xffe14d, b: 0xf7d234, side: 0xa8860f }, make(b) {
-      b.p(14).c(4);
-      b.p(18, { dx: 3 }).o('block', .35, -.5).o('bumper', .7, .4).c(5, .5, .1, .5);
-      b.g(3).c(3);
-      b.p(10, { move: [2.3, 1.2], rail: 1 });
-      b.g(3);
-      b.p(18, { w: 7 }).ck().o('spinner', .5, 0).w('magnet', .15, 0).c(3, 0, .35, .65, 0, 1.4);
-      b.p(16, { dx: -4, w: 4.5 }).c(6);
-      b.p(18).o('saw', .4, 0, { amp: .8 }).o('spikes', .8, 0, { hw: 1.4 }).c(3, -.8, .6, .95).c(3, .8, .6, .95);
-      b.p(12).boost(.2).c(4, 0, .4, 1);
-      b.p(12, { dy: 3.5, rail: 2 });
-      b.g(7, { dy: -3 }).c(5, 0, 0, 1, 0, 2.4);
-      b.p(24).c(5, 0, .4, .8);
-      b.p(20, { w: 7 }).ck().w('giant', .1, 0).o('block', .35, -.75).o('block', .35, .75).o('bumper', .55, 0).o('saw', .75, 0, { amp: .6 }).o('block', .92, 0).c(6, 0, .25, .95);
-      b.g(3.5).c(3);
-      b.p(9, { move: [2.4, 1.3], rail: 1 });
-      b.g(2.5);
-      b.p(9, { move: [2.4, 1.3, 3.1], rail: 1 });
-      b.g(2.5);
-      b.p(16).ck().o('slider', .5, 0, { amp: .7 }).w('shield', .2, 0).c(4, 0, .65, .95);
-      b.p(14, { dy: -3 }).c(5);
-      b.p(20, { w: 7 }).o('spikes', .3, 0, { hw: 4, hd: .5 }).o('spinner', .7, 0, { spd: -1.8 }).c(3, 0, .15, .45, 0, 1.4).c(3, 0, .55, .85, 0, 1.4);
-      b.p(16, { dx: 4, w: 4.5 }).c(6);
-      b.p(12, { dy: 2.5 }).ck().c(4);
-      b.g(4, { dy: -1 }).c(3);
-      b.p(16).o('saw', .5, 0, { amp: .8 }).o('spikes', .85, -.5, { d: 1 }).c(4, 0, .1, .35);
-      b.p(12).jpad(.8).c(3, 0, .1, .6);
-      b.g(9).c(6, 0, 0, 1, 0, 3.4);
-      b.end();
-    } }
+    { name: 'First Roll', theme: TH(0x8fd3ff, 0x5ecb6b, 0x4fb85d, 0x2f7d3c), seq: [
+      ['hint', 'Slide your finger left and right to steer!'], ['start'], ['curves', 3], ['zig'], ['hint', 'Tap JUMP to hop over the gap!'], ['hops', 2, 2.5],
+      ['power', 'magnet'], ['curves', 2], ['hill'], ['hint', 'Pick a path! Left or right?'], ['fork', 'safe', 'coins'], ['boostJump', 5, 2], ['line'], ['zig'], ['padJump', 6]] },
+    { name: 'Hop Hop', theme: TH(0x7fe0e0, 0xffd166, 0xf4b942, 0xc98a2b), seq: [
+      ['start'], ['slalom', 'block', 3], ['hops', 3], ['power', 'shield'], ['steps', 2], ['narrow'], ['hint', 'Jump sideways onto the bonus track!'], ['sideLane', 1, 'block'],
+      ['boostJump'], ['fork', 'hops', 'blocks'], ['zig'], ['hops', 2, 3.5], ['curves', 2], ['padJump']] },
+    { name: 'Bumper Park', theme: TH(0xffc6e0, 0xff8fb8, 0xff7aa8, 0xc44f7d), seq: [
+      ['start'], ['field', 'bumper'], ['curves', 3], ['hops', 2], ['power', 'magnet'], ['fork', 'boost', 'bumpers'], ['slalom', 'bumper', 3], ['hint', 'The side road skips the jumps!'], ['bypass', -1],
+      ['boostJump'], ['down'], ['field', 'bumper'], ['hill'], ['sideLane', -1, 'bumper', 'shield'], ['zig'], ['padJump', 7.5]] },
+    { name: 'Spiky Path', theme: TH(0xffb37a, 0xb58cff, 0xa279f5, 0x6b4fb0), seq: [
+      ['hint', 'Red spikes pop your marble. Steer around or jump!'], ['slalom', 'spikes', 3], ['power', 'shield'], ['hint', 'Jump over the spike strip!'], ['strips', 2], ['narrow'], ['hops', 3],
+      ['fork', 'spikes', 'safe'], ['boostJump', 6, 3], ['slalom', 'spikes', 4], ['sideLane', 1, 'spikes'], ['steps', 3], ['strips', 3], ['curves', 2], ['padJump', 8]] },
+    { name: 'Sky Bridges', theme: TH(0xa9c9ff, 0xffffff, 0xcfdcf5, 0x9fb3d9), seq: [
+      ['start'], ['slalom', 'slider', 2], ['hint', 'This bridge slides. Ride it across!'], ['movers', 1], ['power', 'magnet'], ['narrow'], ['fork', 'high', 'coins'], ['movers', 2],
+      ['boostJump', 6.5, 3], ['bypass', 1], ['slalom', 'slider', 3], ['hill'], ['sideLane', -1, 'block', 'shield'], ['movers', 2], ['zig'], ['padJump', 8]] },
+    { name: 'Spinner City', theme: TH(0x2b2f6b, 0x4dd6d0, 0x3fc2bc, 0x1f7f7b), seq: [
+      ['start'], ['hint', 'Jump over the spinning bar!'], ['spin', 1], ['curves', 2], ['smash'], ['hops', 3], ['fork', 'high', 'blocks'], ['spin', 2], ['narrow'],
+      ['boostJump', 6.5, 3], ['power', 'shield'], ['slalom', 'slider', 3], ['sideLane', 1, 'bumper'], ['spin', 2], ['movers', 1], ['steps', 2], ['padJump', 8.5]] },
+    { name: 'Saw Valley', theme: TH(0x47223a, 0xff9d4d, 0xf58a36, 0x9c4a12), seq: [
+      ['hint', 'Watch out for the rolling saws!'], ['slalom', 'saw', 2], ['down'], ['power', 'shield'], ['hops', 3], ['fork', 'saws', 'safe'], ['down'], ['boostJump', 7, 3.5],
+      ['smash'], ['movers', 2], ['bypass', -1], ['slalom', 'saw', 3], ['down'], ['strips', 2], ['sideLane', 1, 'saw'], ['curves', 2], ['padJump', 8.5]] },
+    { name: 'Candy Canyon', theme: TH(0xbff0d4, 0xff6fa5, 0xffffff, 0xb93c6e), seq: [
+      ['start'], ['field', 'bumper'], ['steps', 3], ['fork', 'hops', 'boost'], ['slalom', 'spikes', 3], ['power', 'magnet'], ['curves', 3, 4.6], ['boostJump', 7, 3],
+      ['spin', 1], ['bypass', 1], ['down'], ['slalom', 'slider', 3], ['sideLane', -1, 'spikes', 'shield'], ['movers', 2], ['fork', 'bumpers', 'high'], ['strips', 2], ['padJump', 8.5]] },
+    { name: 'Frosty Peaks', theme: TH(0xd8f1ff, 0x8fd8ff, 0xffffff, 0x4d8fc4), seq: [
+      ['start'], ['hill'], ['slalom', 'block', 4], ['hops', 4], ['power', 'shield'], ['fork', 'saws', 'hops'], ['narrow'], ['steps', 3], ['down'], ['down'], ['boostJump', 7.5, 3.5],
+      ['spin', 2], ['sideLane', 1, 'saw'], ['movers', 3], ['strips', 3], ['bypass', -1], ['smash'], ['curves', 3, 4.6], ['padJump', 9]] },
+    { name: 'Jungle Jump', theme: TH(0x9be8a0, 0xc98a4b, 0xb87a3d, 0x6e4520), seq: [
+      ['start'], ['hops', 4, 3.5], ['slalom', 'saw', 3], ['fork', 'high', 'spikes'], ['steps', 4], ['power', 'magnet'], ['field', 'bumper'], ['movers', 3], ['boostJump', 7.5, 3],
+      ['sideLane', -1, 'spikes', 'giant'], ['smash'], ['narrow'], ['strips', 3], ['bypass', 1], ['spin', 2], ['down'], ['fork', 'hops', 'saws'], ['slalom', 'slider', 4], ['padJump', 9]] },
+    { name: 'Lava Leap', theme: TH(0x3a1420, 0xff6a3d, 0xffb03d, 0x8f2a12), seq: [
+      ['start'], ['slalom', 'spikes', 4], ['hops', 4, 3.5], ['power', 'shield'], ['spin', 2], ['fork', 'saws', 'bumpers'], ['movers', 3], ['steps', 3], ['boostJump', 8, 3.5],
+      ['strips', 3], ['sideLane', 1, 'saw', 'giant'], ['narrow'], ['slalom', 'saw', 4], ['down'], ['bypass', -1], ['field', 'bumper'], ['fork', 'hops', 'high'], ['spin', 2], ['curves', 3, 4.6], ['padJump', 9.5]] },
+    { name: 'Grand Finale', theme: TH(0x14122e, 0xffe14d, 0xf7d234, 0xa8860f), seq: [
+      ['start'], ['slalom', 'block', 4], ['hops', 4, 3.5], ['spin', 2], ['fork', 'spikes', 'hops'], ['power', 'magnet'], ['movers', 3], ['boostJump', 8, 3.5], ['smash'],
+      ['sideLane', -1, 'saw', 'shield'], ['strips', 3], ['steps', 4], ['slalom', 'saw', 4], ['fork', 'high', 'saws'], ['down'], ['bypass', 1], ['field', 'bumper'], ['narrow'],
+      ['slalom', 'slider', 4], ['movers', 2], ['boostJump', 8, 3], ['sideLane', 1, 'spikes', 'giant'], ['spin', 2], ['fork', 'boost', 'bumpers'], ['padJump', 10]] }
   ];
 
   function build(idx, d) {
     const def = LEVELS[idx], D = DIFFS[d];
-    const L = { idx, d, D, name: def.name, theme: def.theme, pieces: [], obs: [], items: [], pads: [], checks: [], hints: [], coinTotal: 0, finishS: 0 };
-    let s = 0, cx = 0, y = 0, cur = null;
+    const L = { idx, d, D, name: def.name, theme: def.theme, pieces: [], sides: [], obs: [], items: [], pads: [], checks: [], hints: [], coinTotal: 0, finishS: 0 };
+    let s = 0, cx = 0, y = 0, cur = null, wantCk = false, lastCk = 0;
     const lane = (p, xf) => xf * (p.w / 2 - 0.8);
     const at = (t, xf) => { const ss = cur.s0 + t * cur.len; return { s: ss, x: cxBase(cur, ss) + lane(cur, xf || 0), y: yAt(cur, ss) }; };
     const b = {
+      d, main: null,
       p(len, o) {
         o = o || {};
-        cur = { kind: 'p', s0: s, s1: s + len, len, cx0: cx, cx1: cx + (o.dx || 0), y0: y, y1: y + (o.dy || 0), w: (o.w || 6) * D.width, rail: d <= (o.rail || 0), move: null };
+        cur = { kind: 'p', s0: s, s1: s + len, len, cx0: cx, cx1: cx + (o.dx || 0), y0: y, y1: y + (o.dy || 0), w: (o.w || 6) * D.width, rail: d <= (o.rail || 0), move: null, sides: [] };
+        cur.railL = cur.railR = cur.rail;
         if (o.move) cur.move = { amp: o.move[0] * (d === 0 ? 0.5 : 1), spd: o.move[1] * D.spd, ph: o.move[2] || 0 };
-        L.pieces.push(cur); s += len; cx = cur.cx1; y = cur.y1; return b;
+        L.pieces.push(cur); b.main = cur; s += len; cx = cur.cx1; y = cur.y1;
+        if (wantCk && !o.move && !o.dy) { wantCk = false; lastCk = cur.s0; L.checks.push({ s: cur.s0 + 1.5, x: cur.cx0, y: cur.y0, w: cur.w, hit: false }); }
+        return b;
       },
       g(len, o) {
-        o = o || {}; len *= D.gap;
-        cur = { kind: 'gap', s0: s, s1: s + len, len, cx0: cx, cx1: cx, y0: y, y1: y + (o.dy || 0), w: 6, rail: false, move: null };
-        L.pieces.push(cur); s += len; y = cur.y1; return b;
+        o = o || {}; len *= D.gap * (len < 5 ? 1.6 : 1.3);
+        cur = { kind: 'gap', s0: s, s1: s + len, len, cx0: cx, cx1: cx, y0: y, y1: y + (o.dy || 0), w: b.main ? b.main.w : 6, rail: false, move: null, sides: [] };
+        L.pieces.push(cur); b.main = cur; s += len; y = cur.y1; return b;
+      },
+      fork(len) {
+        cur = { kind: 'gap', void: true, s0: s, s1: s + len, len, cx0: cx, cx1: cx, y0: y, y1: y, w: 11 * D.width, rail: false, move: null, sides: [] };
+        L.pieces.push(cur); b.main = cur; s += len; return b;
+      },
+      sp(off0, off1, o) {
+        const par = b.main, t0 = o.t0 || 0, t1 = o.t1 == null ? 1 : o.t1, yo0 = o.y0 || 0;
+        cur = { kind: 'p', par, s0: par.s0 + t0 * par.len, s1: par.s0 + t1 * par.len, off0, off1, yo0, yo1: o.y1 == null ? yo0 : o.y1, w: o.w, rail: d <= (o.rail || 0), move: null };
+        cur.len = cur.s1 - cur.s0; cur.railL = cur.railR = cur.rail; par.sides.push(cur); L.sides.push(cur); return b;
+      },
+      br(sd, o) { const M = b.main.w, off = sd * (M / 4 + 0.5); return b.sp(off, off, Object.assign({ w: M / 2 - 1 }, o || {})); },
+      lane(sd, mode, o) {
+        const m = b.main, w = 3.8 * D.width, far = sd * (m.w / 2 + 1.3 + w / 2), near = sd * (m.w / 2 - w / 2);
+        b.sp(mode === 'in' ? near : far, mode === 'out' ? near : far, Object.assign({ w }, o || {}));
+        cur.wall = sd; // the outer edge always has a wall, so a sideways jump cannot overshoot
+        if (sd > 0) { m.railR = false; cur.railL = false; cur.railR = true; } else { m.railL = false; cur.railR = false; cur.railL = true; }
+        return b;
       },
       c(n, x, t0, t1, x1, h) {
         const gap = cur.kind === 'gap';
-        x = x || 0; if (t0 == null) t0 = gap ? 0.1 : 0.15; if (t1 == null) t1 = gap ? 0.9 : 0.85; if (x1 == null) x1 = x; if (h == null) h = gap ? 1.5 : 0;
+        x = x || 0; if (t0 == null) t0 = gap ? 0.1 : 0.15; if (t1 == null) t1 = gap ? 0.9 : 0.85; if (x1 == null) x1 = x; if (h == null) h = gap ? 2.4 : 0;
         for (let i = 0; i < n; i++) {
           const u = n === 1 ? 0.5 : i / (n - 1), pos = at(t0 + (t1 - t0) * u, x + (x1 - x) * u);
           L.items.push({ type: 'coin', s: pos.s, x: pos.x, y: pos.y + 0.75 + 4 * h * u * (1 - u) });
@@ -254,16 +194,16 @@
         L.obs.push(ob); return b;
       },
       w(type, t, x) { const pos = at(t, x); L.items.push({ type, s: pos.s, x: pos.x, y: pos.y + 0.9 }); return b; },
-      boost(t) { const pos = at(t, 0); L.pads.push({ type: 'boost', s: pos.s, x: pos.x, y: pos.y, w: cur.w, slope: (cur.y1 - cur.y0) / cur.len, last: -9 }); return b; },
+      boost(t) { const pos = at(t, 0); L.pads.push({ type: 'boost', s: pos.s, x: pos.x, y: pos.y, w: cur.w, slope: slopeOf(cur), last: -9 }); return b; },
       jpad(t) { const pos = at(t, 0); L.pads.push({ type: 'jpad', s: pos.s, x: pos.x, y: pos.y, w: cur.w, slope: 0, last: -9 }); return b; },
-      ck() { const pos = at(0, 0); L.checks.push({ s: cur.s0 + 1.5, x: pos.x, y: pos.y, w: cur.w, hit: false }); return b; },
       hint(txt, t) { L.hints.push({ s: cur.s0 + (t || 0) * cur.len, txt, shown: false }); return b; },
-      end() { b.p(26, { rail: 2 }); L.finishS = cur.s0 + 8; L.finishW = cur.w; L.finishX = cur.cx0; L.finishY = cur.y0; return b; }
+      end() { b.p(30, { rail: 2 }); L.finishS = cur.s0 + 9; L.finishW = cur.w; L.finishX = cur.cx0; L.finishY = cur.y0; return b; }
     };
-    def.make(b);
+    for (const sec of def.seq) { if (s - lastCk >= 45) wantCk = true; S[sec[0]].apply(null, [b].concat(sec.slice(1))); }
+    b.end();
     L.pieces.forEach((p, i) => {
       p.i = i;
-      if (p.kind === 'gap') { const a = L.pieces[i - 1], n = L.pieces[i + 1]; p.w = Math.min(a.w, n.w); p.cx1 = n.cx0; }
+      if (p.kind === 'gap' && !p.void) { const a = L.pieces[i - 1], n = L.pieces[i + 1]; p.w = Math.min(a.w, n.w); p.cx1 = n.cx0; }
     });
     L.coinTotal = L.items.filter(i => i.type === 'coin').length;
     L.start = { s: 1.5, hit: true };
@@ -281,14 +221,31 @@
   }
   function die(st, why) { if (st.dead || st.done) return; st.dead = true; st.deadT = 0.9; st.ev.push([why]); }
 
+  // every platform (main track, branches, side tracks) under this spot; picks the highest one the ball can stand on
   function ground(L, x, s, t, foot) {
     const p = pieceAt(L, s); let gy = -1e9, slope = 0, gp = null;
-    if (p.kind === 'p' && Math.abs(x - cxAt(p, s, t)) <= p.w / 2 + 0.2) { gy = yAt(p, s); slope = (p.y1 - p.y0) / p.len; gp = p; }
+    if (p.kind === 'p' && Math.abs(x - cxAt(p, s, t)) <= p.w / 2 + 0.2) { const yy = yAt(p, s); if (foot >= yy - 0.7) { gy = yy; slope = slopeOf(p); gp = p; } }
+    for (const q of p.sides) {
+      if (s < q.s0 || s > q.s1 || Math.abs(x - cxBase(q, s)) > q.w / 2 + 0.2) continue;
+      const yy = yAt(q, s); if (foot >= yy - 0.7 && yy > gy) { gy = yy; slope = slopeOf(q); gp = q; }
+    }
     for (const o of L.obs) {
       if (o.dead || o.type !== 'block') continue;
       if (Math.abs(o.s - s) <= o.hd + 0.25 && Math.abs(o.x - x) <= o.hw + 0.25) { const top = o.y + o.h; if (foot >= top - 0.4 && top > gy) { gy = top; slope = 0; gp = null; } }
     }
     return gy > -1e8 ? { y: gy, slope, p: gp } : null;
+  }
+
+  // lateral extents [left, right, height] of the platforms at s that the ball is not underneath
+  function intervals(L, s, t, foot, merge) {
+    const p = pieceAt(L, s), out = [];
+    if (p.kind === 'p') { const c = cxAt(p, s, t), yy = yAt(p, s); if (foot > yy - 0.7) out.push([c - p.w / 2, c + p.w / 2, yy]); }
+    for (const q of p.sides) { if (s < q.s0 || s > q.s1) continue; const c = cxBase(q, s), yy = yAt(q, s); if (foot > yy - 0.7) out.push([c - q.w / 2, c + q.w / 2, yy]); }
+    out.sort((a, b) => a[0] - b[0]);
+    if (!merge) return out;
+    const m = [];
+    for (const iv of out) { const l = m[m.length - 1]; if (l && iv[0] <= l[1] + 0.05) { l[1] = Math.max(l[1], iv[1]); l[2] = Math.min(l[2], iv[2]); } else m.push(iv.slice()); }
+    return m;
   }
 
   function step(st, L, inp, dt) {
@@ -320,12 +277,34 @@
       st.y = g.y + r; st.vy = g.slope * st.vs; st.grounded = true; st.gp = g.p; st.coyote = 0.12; foot = g.y;
     } else { st.grounded = false; st.gp = null; st.coyote -= dt; }
 
-    const p = pieceAt(L, st.s), cxx = cxAt(p, st.s, t), base = yAt(p, st.s);
-    const railOn = L.d === 0 ? foot > base - 0.7 : (p.kind === 'p' && p.rail && foot > base - 0.7 && foot < base + 1.3);
-    if (railOn) {
-      const lim = Math.max(0.1, p.w / 2 - r - 0.15);
-      if (st.x > cxx + lim) { st.x = cxx + lim; if (st.vx > 0) st.vx = 0; }
-      if (st.x < cxx - lim) { st.x = cxx - lim; if (st.vx < 0) st.vx = 0; }
+    const p = pieceAt(L, st.s);
+    let base = p.kind === 'p' ? yAt(p, st.s) : 1e9;
+    for (const q of p.sides) if (st.s >= q.s0 && st.s <= q.s1) base = Math.min(base, yAt(q, st.s));
+    if (base > 1e8) base = yAt(p, st.s);
+    if (L.d === 0) {
+      // Easy: invisible walls. The ball is kept over the nearest platform unless it is jumping towards a neighbouring one.
+      const iv = intervals(L, st.s, t, foot, true); let a, b2, ok = true;
+      if (iv.length) {
+        let near = iv[0], nd = 1e9;
+        for (const v of iv) { const dd = st.x < v[0] ? v[0] - st.x : st.x > v[1] ? st.x - v[1] : 0; if (dd < nd) { nd = dd; near = v; } }
+        a = near[0]; b2 = near[1];
+        if (foot > near[2] + 1 && Math.abs(inp.steer) > 0.3) for (const v of iv) { if (v === near) continue; if (inp.steer > 0 ? (v[0] > b2 - 0.01 && v[0] - b2 < 4.5) : (v[1] < a + 0.01 && a - v[1] < 4.5)) ok = false; }
+      } else if (!p.void && foot > base - 0.7) { const c = cxAt(p, st.s, t); a = c - p.w / 2; b2 = c + p.w / 2; } else ok = false;
+      if (ok) {
+        const lo = a + r + 0.15, hi = Math.max(lo, b2 - r - 0.15), m = 12 * dt;
+        if (st.x > hi) { st.x = Math.max(hi, st.x - Math.max(m, st.x - hi - 1.5)); if (st.vx > 0) st.vx = 0; }
+        if (st.x < lo) { st.x = Math.min(lo, st.x + Math.max(m, lo - st.x - 1.5)); if (st.vx < 0) st.vx = 0; }
+      }
+    } else if (st.grounded && st.gp && st.gp.rail) {
+      const q = st.gp, c = cxAt(q, st.s, t), lim = Math.max(0.1, q.w / 2 - r - 0.15);
+      if (q.railR && st.x > c + lim) { st.x = c + lim; if (st.vx > 0) st.vx = 0; }
+      if (q.railL && st.x < c - lim) { st.x = c - lim; if (st.vx < 0) st.vx = 0; }
+    }
+    for (const q of p.sides) {
+      if (!q.wall || st.s < q.s0 || st.s > q.s1) continue;
+      const yy = yAt(q, st.s); if (foot < yy - 0.7 || foot > yy + 4.5) continue;
+      const c = cxBase(q, st.s), lim = q.w / 2 - r - 0.15, rel = (st.x - c) * q.wall;
+      if (rel > lim && rel < lim + 2.5) { st.x = c + q.wall * lim; if (st.vx * q.wall > 0) st.vx = 0; }
     }
     if (st.y < base - 8) { die(st, 'fall'); return; }
 
@@ -387,14 +366,15 @@
     // pads
     if (st.grounded) for (const pd of L.pads) {
       if (t - pd.last < 1) continue;
-      if (pd.type === 'boost' && Math.abs(st.s - pd.s) < 1.2) { pd.last = t; st.boostT = 2.2; st.ev.push(['boost']); }
+      if (Math.abs(st.x - pd.x) > pd.w / 2 + 0.3 || Math.abs(foot - pd.y) > 0.8) continue;
+      if (pd.type === 'boost' && Math.abs(st.s - pd.s) < 1.2) { pd.last = t; st.boostT = 2.6; st.ev.push(['boost']); }
       if (pd.type === 'jpad' && Math.abs(st.s - pd.s) < 0.8) { pd.last = t; st.vy = PADJUMP; st.boostT = Math.max(st.boostT, 1.2); st.grounded = false; st.coyote = 0; st.ev.push(['pad']); }
     }
-    for (const c of L.checks) if (!c.hit && st.s >= c.s && Math.abs(foot - base) < 4) { c.hit = true; st.check = c; st.ev.push(['check', c]); }
+    for (const c of L.checks) if (!c.hit && st.s >= c.s) { c.hit = true; st.check = c; st.ev.push(['check', c]); }
     for (const h of L.hints) if (!h.shown && st.s >= h.s) { h.shown = true; st.ev.push(['hint', h.txt]); }
     if (!st.done && st.s >= L.finishS) { st.done = true; st.ev.push(['finish']); }
   }
 
-  const api = { R, DIFFS, LEVELS, build, newState, step, ground, pieceAt, cxAt, cxBase, yAt, moveOff, obX };
+  const api = { R, DIFFS, LEVELS, build, newState, step, ground, intervals, slopeOf, pieceAt, cxAt, cxBase, yAt, moveOff, obX };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.MarbleCore = api;
 })(typeof self !== 'undefined' ? self : this);
